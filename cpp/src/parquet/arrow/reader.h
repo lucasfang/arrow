@@ -21,6 +21,7 @@
 // N.B. we don't include async_generator.h as it's relatively heavy
 #include <functional>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "parquet/file_reader.h"
@@ -48,8 +49,12 @@ namespace arrow {
 
 class ColumnChunkReader;
 class ColumnReader;
+class FileColumnIterator;
 struct SchemaManifest;
 class RowGroupReader;
+
+using FileColumnIteratorFactory =
+    std::function<FileColumnIterator*(int, ParquetFileReader*)>;
 
 /// \brief Arrow read adapter class for deserializing Parquet files as Arrow row batches.
 ///
@@ -135,6 +140,27 @@ class PARQUET_EXPORT FileReader {
   // Returns error status if the column of interest is not flat.
   // The indicated column index is relative to the schema
   virtual ::arrow::Status GetColumn(int i, std::unique_ptr<ColumnReader>* out) = 0;
+
+  /// \brief Return a ColumnReader with a custom FileColumnIteratorFactory
+  /// and leaf column filtering.
+  ///
+  /// This allows callers to customize page reading behavior (e.g., setting
+  /// data_page_filter for page-level skipping) and to select only specific
+  /// leaf columns within a nested field. The factory is called once per leaf
+  /// column included in column_indices.
+  ///
+  /// \param i top-level field index (same as GetColumn(int i, ...))
+  /// \param column_indices leaf column indices to include (enables sub-column
+  ///        projection within nested types)
+  /// \param iterator_factory factory to create FileColumnIterator per leaf
+  /// \param[out] out the ColumnReader (may be nullptr if all leaves are pruned)
+  virtual ::arrow::Status GetColumn(
+      int i, const std::shared_ptr<std::unordered_set<int>>& column_indices,
+      FileColumnIteratorFactory iterator_factory,
+      std::unique_ptr<ColumnReader>* out) {
+    return ::arrow::Status::NotImplemented(
+        "GetColumn with factory not implemented");
+  }
 
   /// \brief Return arrow schema for all the columns.
   virtual ::arrow::Status GetSchema(std::shared_ptr<::arrow::Schema>* out) = 0;
@@ -316,6 +342,43 @@ class PARQUET_EXPORT ColumnReader {
   // the data available in the file.
   virtual ::arrow::Status NextBatch(int64_t batch_size,
                                     std::shared_ptr<::arrow::ChunkedArray>* out) = 0;
+
+  /// \brief Leaf column indices covered by this (sub)tree, in leaf order.
+  ///
+  /// Used to drive per-leaf row filtering: after page-level skipping each leaf
+  /// lives in its own compressed coordinate space, so callers must reset and
+  /// skip/read each leaf independently rather than in lockstep.
+  virtual std::vector<int> LeafColumnIndices() const { return {}; }
+
+  /// \brief Reset the leaf identified by col_idx and reserve space for
+  /// `reserve` records (in that leaf's post-page-filter compressed space).
+  /// Must be called before SkipRecords()/ReadRecords() for that leaf, and
+  /// followed by BuildArray() to get the result.
+  virtual ::arrow::Status ResetLeaf(int col_idx, int64_t reserve) {
+    return ::arrow::Status::NotImplemented("ResetLeaf not implemented");
+  }
+
+  /// \brief Skip num_records on the leaf identified by col_idx and return the
+  /// number of records actually skipped. Returns 0 when num_records <= 0 or
+  /// col_idx does not belong to this (sub)tree. May throw ParquetException on a
+  /// decode error; callers convert it to Status at the public boundary.
+  virtual int64_t SkipRecords(int col_idx, int64_t num_records) { return 0; }
+
+  /// \brief Read num_records on the leaf identified by col_idx and return the
+  /// number of records actually read. Values accumulate across successive calls
+  /// until BuildArray() is called. Returns 0 when num_records <= 0 or col_idx
+  /// does not belong to this (sub)tree. May throw ParquetException on a decode
+  /// error; callers convert it to Status at the public boundary.
+  virtual int64_t ReadRecords(int col_idx, int64_t num_records) { return 0; }
+
+  /// \brief Build the Arrow array from previously loaded data.
+  /// For leaf readers, calls TransferColumnData if not already done.
+  /// For nested readers, assembles the nested array from child arrays.
+  virtual ::arrow::Status BuildArray(
+      int64_t length_upper_bound,
+      std::shared_ptr<::arrow::ChunkedArray>* out) {
+    return ::arrow::Status::NotImplemented("BuildArray not implemented");
+  }
 };
 
 /// \brief Experimental helper class for bindings (like Python) that struggle

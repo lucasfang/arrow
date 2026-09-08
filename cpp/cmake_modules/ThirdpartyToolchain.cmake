@@ -814,6 +814,7 @@ if(DEFINED ENV{ARROW_THRIFT_URL})
   set(THRIFT_SOURCE_URL "$ENV{ARROW_THRIFT_URL}")
 else()
   set_urls(THRIFT_SOURCE_URL
+           "https://archive.apache.org/dist/thrift/${ARROW_THRIFT_BUILD_VERSION}/thrift-${ARROW_THRIFT_BUILD_VERSION}.tar.gz"
            "https://www.apache.org/dyn/closer.cgi?action=download&filename=/thrift/${ARROW_THRIFT_BUILD_VERSION}/thrift-${ARROW_THRIFT_BUILD_VERSION}.tar.gz"
            "https://downloads.apache.org/thrift/${ARROW_THRIFT_BUILD_VERSION}/thrift-${ARROW_THRIFT_BUILD_VERSION}.tar.gz"
            "https://apache.claz.org/thrift/${ARROW_THRIFT_BUILD_VERSION}/thrift-${ARROW_THRIFT_BUILD_VERSION}.tar.gz"
@@ -981,6 +982,11 @@ set(EP_COMMON_CMAKE_ARGS
 # if building with a toolchain file, pass that through
 if(CMAKE_TOOLCHAIN_FILE)
   list(APPEND EP_COMMON_CMAKE_ARGS -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE})
+endif()
+
+# Compatibility with bundled dependencies that require old CMake versions.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.30")
+  list(APPEND EP_COMMON_CMAKE_ARGS -DCMAKE_POLICY_VERSION_MINIMUM=3.5)
 endif()
 
 # and crosscompiling emulator (for try_run() )
@@ -1716,6 +1722,7 @@ macro(build_thrift)
       -DWITH_JAVASCRIPT=OFF
       -DWITH_LIBEVENT=OFF
       -DWITH_NODEJS=OFF
+      -DWITH_OPENSSL=OFF
       -DWITH_PYTHON=OFF
       -DWITH_QT5=OFF
       -DWITH_ZLIB=OFF)

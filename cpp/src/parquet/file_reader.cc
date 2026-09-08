@@ -207,6 +207,117 @@ const RowGroupMetaData* RowGroupReader::metadata() const { return contents_->met
   return {col_start, col_length};
 }
 
+// CachedInputStream: InputStream adapter that reads through ReadRangeCache with
+// zero-cost skip for non-cached pages. Used for page-level caching where only
+// specific pages are pre-buffered.
+//
+// Key behavior:
+// - Read(): On cache hit, returns cached data. On cache miss, returns zero-filled
+//   buffer (zero I/O). This makes InputStream::Advance() (which calls Read() and
+//   discards) effectively free for skipped pages.
+// - Peek(): Always falls back to source on cache miss, because PageReader uses
+//   Peek() to read Thrift page headers (~30 bytes) which must have real data.
+class CachedInputStream : public ::arrow::io::InputStream {
+ public:
+  CachedInputStream(
+      std::shared_ptr<::arrow::io::internal::ReadRangeCache> cache,
+      std::shared_ptr<ArrowInputFile> source,
+      int64_t offset, int64_t length)
+      : cache_(std::move(cache)),
+        source_(std::move(source)),
+        base_offset_(offset),
+        length_(length) {}
+
+  ::arrow::Status Close() override {
+    closed_ = true;
+    return ::arrow::Status::OK();
+  }
+
+  bool closed() const override { return closed_; }
+
+  ::arrow::Result<int64_t> Tell() const override { return position_; }
+
+  ::arrow::Result<std::string_view> Peek(int64_t nbytes) override {
+    int64_t to_read = std::min(nbytes, length_ - position_);
+    if (to_read <= 0) {
+      return std::string_view();
+    }
+    ::arrow::io::ReadRange range{base_offset_ + position_, to_read};
+    auto result = cache_->Read(range);
+    if (result.ok()) {
+      peek_buffer_ = *result;
+    } else {
+      // Peek is used for Thrift page headers (~30 bytes) — must read real data
+      ARROW_ASSIGN_OR_RAISE(peek_buffer_,
+                            source_->ReadAt(range.offset, range.length));
+    }
+    return std::string_view(
+        reinterpret_cast<const char*>(peek_buffer_->data()),
+        static_cast<size_t>(peek_buffer_->size()));
+  }
+
+  ::arrow::Result<int64_t> Read(int64_t nbytes, void* out) override {
+    int64_t to_read = std::min(nbytes, length_ - position_);
+    if (to_read <= 0) return 0;
+    ::arrow::io::ReadRange range{base_offset_ + position_, to_read};
+    auto result = cache_->Read(range);
+    if (result.ok()) {
+      auto& buf = *result;
+      memcpy(out, buf->data(), static_cast<size_t>(buf->size()));
+      position_ += buf->size();
+      return buf->size();
+    }
+    // Cache miss: fall back to real I/O from source
+    ARROW_ASSIGN_OR_RAISE(auto buf, source_->ReadAt(range.offset, range.length));
+    memcpy(out, buf->data(), static_cast<size_t>(buf->size()));
+    position_ += buf->size();
+    return buf->size();
+  }
+
+  ::arrow::Result<std::shared_ptr<::arrow::Buffer>> Read(int64_t nbytes) override {
+    int64_t to_read = std::min(nbytes, length_ - position_);
+    if (to_read <= 0) {
+      return std::make_shared<::arrow::Buffer>(nullptr, 0);
+    }
+    ::arrow::io::ReadRange range{base_offset_ + position_, to_read};
+    auto result = cache_->Read(range);
+    if (result.ok()) {
+      position_ += (*result)->size();
+      return *result;
+    }
+    // Cache miss: fall back to real I/O from source
+    ARROW_ASSIGN_OR_RAISE(auto buf, source_->ReadAt(range.offset, range.length));
+    position_ += buf->size();
+    return std::shared_ptr<::arrow::Buffer>(std::move(buf));
+  }
+
+  // Override Advance to avoid real I/O for skipped pages.
+  // The default InputStream::Advance() calls Read() and discards the result,
+  // which would trigger source_->ReadAt() on cache miss — defeating page-level
+  // I/O skipping via data_page_filter. Since Advance() is only used to skip
+  // over data that will not be consumed, we can safely just move the position.
+  ::arrow::Status Advance(int64_t nbytes) override {
+    if (nbytes <= 0) {
+      return ::arrow::Status::OK();
+    }
+    int64_t remaining = length_ - position_;
+    if (remaining <= 0) {
+      return ::arrow::Status::OK();
+    }
+    position_ += std::min(nbytes, remaining);
+    return ::arrow::Status::OK();
+  }
+
+ private:
+  std::shared_ptr<::arrow::io::internal::ReadRangeCache> cache_;
+  std::shared_ptr<ArrowInputFile> source_;
+  int64_t base_offset_;
+  int64_t length_;
+  int64_t position_ = 0;
+  bool closed_ = false;
+  std::shared_ptr<::arrow::Buffer> peek_buffer_;
+};
+
 // RowGroupReader::Contents implementation for the Parquet file specification
 class SerializedRowGroup : public RowGroupReader::Contents {
  public:
@@ -242,6 +353,11 @@ class SerializedRowGroup : public RowGroupReader::Contents {
       // segments.
       PARQUET_ASSIGN_OR_THROW(auto buffer, cached_source_->Read(col_range));
       stream = std::make_shared<::arrow::io::BufferReader>(buffer);
+    } else if (cached_source_) {
+      // Page-level caching: read through cache with fallback to source.
+      // Advance() is zero-cost for skipped pages via data_page_filter.
+      stream = std::make_shared<CachedInputStream>(
+          cached_source_, source_, col_range.offset, col_range.length);
     } else {
       stream = properties_.GetStream(source_, col_range.offset, col_range.length);
     }
@@ -413,6 +529,26 @@ class SerializedFile : public ParquetFileReader::Contents {
         ranges.push_back(
             ComputeColumnChunkRange(file_metadata_.get(), source_size_, row, col));
       }
+    }
+    return cached_source_->WaitFor(ranges);
+  }
+
+  void PreBufferRanges(const std::vector<::arrow::io::ReadRange>& ranges,
+                       const ::arrow::io::IOContext& ctx,
+                       const ::arrow::io::CacheOptions& options) {
+    cached_source_ =
+        std::make_shared<::arrow::io::internal::ReadRangeCache>(source_, ctx, options);
+    // Do NOT set prebuffered_column_chunks_ bitmap — GetColumnPageReader will
+    // use CachedInputStream path instead of full-chunk BufferReader path.
+    prebuffered_column_chunks_.clear();
+    PARQUET_THROW_NOT_OK(cached_source_->Cache(ranges));
+  }
+
+  ::arrow::Future<> WhenBufferedRanges(
+      const std::vector<::arrow::io::ReadRange>& ranges) const {
+    if (!cached_source_) {
+      return ::arrow::Status::Invalid(
+          "Must call PreBufferRanges before WhenBufferedRanges");
     }
     return cached_source_->WaitFor(ranges);
   }
@@ -909,6 +1045,22 @@ void ParquetFileReader::PreBuffer(const std::vector<int>& row_groups,
   SerializedFile* file =
       ::arrow::internal::checked_cast<SerializedFile*>(contents_.get());
   return file->WhenBuffered(row_groups, column_indices);
+}
+
+void ParquetFileReader::PreBufferRanges(
+    const std::vector<::arrow::io::ReadRange>& ranges,
+    const ::arrow::io::IOContext& ctx,
+    const ::arrow::io::CacheOptions& options) {
+  SerializedFile* file =
+      ::arrow::internal::checked_cast<SerializedFile*>(contents_.get());
+  file->PreBufferRanges(ranges, ctx, options);
+}
+
+::arrow::Future<> ParquetFileReader::WhenBufferedRanges(
+    const std::vector<::arrow::io::ReadRange>& ranges) const {
+  SerializedFile* file =
+      ::arrow::internal::checked_cast<SerializedFile*>(contents_.get());
+  return file->WhenBufferedRanges(ranges);
 }
 
 // ----------------------------------------------------------------------

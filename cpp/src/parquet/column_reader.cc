@@ -208,6 +208,39 @@ ReaderProperties default_reader_properties() {
   return default_reader_properties;
 }
 
+void PageReader::set_data_page_read_plan(
+    int64_t first_data_page_offset,
+    std::vector<DataPageReadPlanEntry> data_pages) {
+  if (data_page_filter_) {
+    throw ParquetException(
+        "data_page_filter and data_page_read_plan cannot be enabled together");
+  }
+  if (first_data_page_offset < 0) {
+    throw ParquetException("Invalid negative first data page offset");
+  }
+
+  int64_t previous_end = first_data_page_offset;
+  int32_t previous_ordinal = -1;
+  for (const auto& page : data_pages) {
+    int64_t page_end;
+    if (page.page_ordinal < 0 || page.offset < first_data_page_offset ||
+        page.compressed_page_size <= 0 ||
+        AddWithOverflow(page.offset, page.compressed_page_size, &page_end)) {
+      throw ParquetException("Invalid data page read plan entry");
+    }
+    if (page.offset < previous_end || page.page_ordinal <= previous_ordinal) {
+      throw ParquetException("Data page read plan entries must be ordered");
+    }
+    previous_end = page_end;
+    previous_ordinal = page.page_ordinal;
+  }
+
+  data_page_read_plan_enabled_ = true;
+  first_data_page_offset_ = first_data_page_offset;
+  data_page_read_plan_ = std::move(data_pages);
+  next_data_page_ = 0;
+}
+
 namespace {
 
 // Extracts encoded statistics from V1 and V2 data page headers
@@ -430,9 +463,43 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
 
   // Loop here because there may be unhandled page types that we skip until
   // finding a page that we do know what to do with
-  while (seen_num_values_ < total_num_values_) {
+  while (data_page_read_plan_enabled_ || seen_num_values_ < total_num_values_) {
+    const DataPageReadPlanEntry* planned_data_page = nullptr;
+    uint32_t page_header_limit = max_page_header_size_;
+
+    if (data_page_read_plan_enabled_) {
+      if (next_data_page_ >= data_page_read_plan_.size()) {
+        return nullptr;
+      }
+
+      PARQUET_ASSIGN_OR_THROW(int64_t current_position, stream_->Tell());
+      if (current_position < first_data_page_offset_) {
+        page_header_limit = static_cast<uint32_t>(std::min<int64_t>(
+            page_header_limit, first_data_page_offset_ - current_position));
+      } else {
+        planned_data_page = &data_page_read_plan_[next_data_page_];
+        if (current_position > planned_data_page->offset) {
+          throw ParquetException("Data page read plan points behind stream position");
+        }
+        PARQUET_THROW_NOT_OK(
+            stream_->Advance(planned_data_page->offset - current_position));
+        PARQUET_ASSIGN_OR_THROW(int64_t target_position, stream_->Tell());
+        if (target_position != planned_data_page->offset) {
+          throw ParquetException("Failed to seek to planned data page");
+        }
+        page_ordinal_ = planned_data_page->page_ordinal;
+        page_header_limit = static_cast<uint32_t>(std::min<int64_t>(
+            page_header_limit, planned_data_page->compressed_page_size));
+      }
+    }
+
+    if (page_header_limit == 0) {
+      throw ParquetException("No bytes available for page header");
+    }
+
     uint32_t header_size = 0;
-    uint32_t allowed_page_size = kDefaultPageHeaderSize;
+    uint32_t allowed_page_size =
+        std::min<uint32_t>(kDefaultPageHeaderSize, page_header_limit);
 
     // Page headers can be very large because of page statistics
     // We try to deserialize a larger buffer progressively
@@ -458,11 +525,12 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
         // Failed to deserialize. Double the allowed page header size and try again
         std::stringstream ss;
         ss << e.what();
-        allowed_page_size *= 2;
-        if (allowed_page_size > max_page_header_size_) {
+        if (allowed_page_size >= page_header_limit) {
           ss << "Deserializing page header failed.\n";
           throw ParquetException(ss.str());
         }
+        allowed_page_size =
+            std::min<uint32_t>(allowed_page_size * 2, page_header_limit);
       }
     }
     // Advance the stream offset
@@ -472,6 +540,20 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
     int uncompressed_len = current_page_header_.uncompressed_page_size;
     if (compressed_len < 0 || uncompressed_len < 0) {
       throw ParquetException("Invalid page header");
+    }
+
+    const PageType::type page_type = LoadEnumSafe(&current_page_header_.type);
+    if (planned_data_page != nullptr) {
+      if (page_type != PageType::DATA_PAGE && page_type != PageType::DATA_PAGE_V2) {
+        throw ParquetException("Data page read plan points to a non-data page");
+      }
+      int64_t total_compressed_size;
+      if (AddWithOverflow(static_cast<int64_t>(header_size),
+                          static_cast<int64_t>(compressed_len),
+                          &total_compressed_size) ||
+          total_compressed_size != planned_data_page->compressed_page_size) {
+        throw ParquetException("Planned data page size does not match page header");
+      }
     }
 
     EncodedStatistics data_page_statistics;
@@ -493,8 +575,6 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
          << compressed_len << ")";
       ParquetException::EofException(ss.str());
     }
-
-    const PageType::type page_type = LoadEnumSafe(&current_page_header_.type);
 
     if (properties_.page_checksum_verification() && current_page_header_.__isset.crc &&
         PageCanUseChecksum(page_type)) {
@@ -534,6 +614,9 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
                                               LoadEnumSafe(&dict_header.encoding),
                                               is_sorted);
     } else if (page_type == PageType::DATA_PAGE) {
+      if (planned_data_page != nullptr) {
+        ++next_data_page_;
+      }
       ++page_ordinal_;
       const format::DataPageHeader& header = current_page_header_.data_page_header;
       page_buffer =
@@ -545,6 +628,9 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
           LoadEnumSafe(&header.repetition_level_encoding), uncompressed_len,
           std::move(data_page_statistics));
     } else if (page_type == PageType::DATA_PAGE_V2) {
+      if (planned_data_page != nullptr) {
+        ++next_data_page_;
+      }
       ++page_ordinal_;
       const format::DataPageHeaderV2& header = current_page_header_.data_page_header_v2;
 

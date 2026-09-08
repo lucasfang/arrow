@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "arrow/array.h"
+#include "arrow/array/concatenate.h"
 #include "arrow/extension_type.h"
 #include "arrow/ipc/writer.h"
 #include "arrow/record_batch.h"
@@ -142,13 +143,24 @@ class ArrowColumnWriterV2 {
             leaf_idx, ctx, [&](const MultipathLevelBuilderResult& result) {
               size_t visited_component_size = result.post_list_visited_elements.size();
               DCHECK_GT(visited_component_size, 0);
-              if (visited_component_size != 1) {
-                return Status::NotImplemented(
-                    "Lists with non-zero length null components are not supported");
+              std::shared_ptr<Array> values_array;
+              if (visited_component_size == 1) {
+                const ElementRange& range = result.post_list_visited_elements[0];
+                values_array = result.leaf_array->Slice(range.start, range.Size());
+              } else {
+                // Multiple leaf ranges can be produced when child values are
+                // skipped, such as null fixed-size-list slots, or when
+                // list-view ranges are non-contiguous. Concatenate the slices
+                // in logical write order.
+                ::arrow::ArrayVector arrays;
+                arrays.reserve(visited_component_size);
+                for (const auto& range : result.post_list_visited_elements) {
+                  DCHECK(!range.Empty());
+                  arrays.push_back(result.leaf_array->Slice(range.start, range.Size()));
+                }
+                ARROW_ASSIGN_OR_RAISE(values_array,
+                                      ::arrow::Concatenate(arrays, ctx->memory_pool));
               }
-              const ElementRange& range = result.post_list_visited_elements[0];
-              std::shared_ptr<Array> values_array =
-                  result.leaf_array->Slice(range.start, range.Size());
 
               return column_writer->WriteArrow(result.def_levels, result.rep_levels,
                                                result.def_rep_level_count, *values_array,
@@ -314,6 +326,14 @@ class FileWriterImpl : public FileWriter {
     return Status::OK();
   }
 
+  int64_t GetBufferedSize() override {
+    if (row_group_writer_ == nullptr) {
+      return 0;
+    }
+    return row_group_writer_->total_compressed_bytes() +
+      row_group_writer_->total_compressed_bytes_written();
+  }
+
   Status Close() override {
     if (!closed_) {
       // Make idempotent
@@ -418,10 +438,13 @@ class FileWriterImpl : public FileWriter {
 
     // Max number of rows allowed in a row group.
     const int64_t max_row_group_length = this->properties().max_row_group_length();
+    const int64_t max_row_group_size = this->properties().max_row_group_size();
 
     // Initialize a new buffered row group writer if necessary.
     if (row_group_writer_ == nullptr || !row_group_writer_->buffered() ||
-        row_group_writer_->num_rows() >= max_row_group_length) {
+        row_group_writer_->num_rows() >= max_row_group_length ||
+        (row_group_writer_->total_compressed_bytes_written() +
+         row_group_writer_->total_compressed_bytes() >= max_row_group_size)) {
       RETURN_NOT_OK(NewBufferedRowGroup());
     }
 

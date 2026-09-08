@@ -210,6 +210,17 @@ class PARQUET_EXPORT ParquetFileReader {
   ::arrow::Future<> WhenBuffered(const std::vector<int>& row_groups,
                                  const std::vector<int>& column_indices) const;
 
+  /// Pre-buffer arbitrary byte ranges (e.g., page-level ranges from OffsetIndex).
+  /// Unlike PreBuffer(), this does NOT set the column bitmap, so
+  /// GetColumnPageReader will use CachedInputStream (page-level cache path).
+  void PreBufferRanges(const std::vector<::arrow::io::ReadRange>& ranges,
+                       const ::arrow::io::IOContext& ctx,
+                       const ::arrow::io::CacheOptions& options);
+
+  /// Wait for arbitrary byte ranges to be pre-buffered.
+  ::arrow::Future<> WhenBufferedRanges(
+      const std::vector<::arrow::io::ReadRange>& ranges) const;
+
  private:
   // Holds a pointer to an instance of Contents implementation
   std::unique_ptr<Contents> contents_;

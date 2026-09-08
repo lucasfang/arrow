@@ -76,6 +76,18 @@ struct PARQUET_EXPORT DataPageStats {
   std::optional<int32_t> num_rows;
 };
 
+/// \brief Identifies a data page that PageReader should read directly.
+///
+/// The offset is relative to the beginning of the column chunk stream passed to
+/// PageReader::Open. The compressed size includes both the serialized page header
+/// and the compressed page body. The ordinal is the original data page ordinal in
+/// the column chunk and does not include the dictionary page.
+struct PARQUET_EXPORT DataPageReadPlanEntry {
+  int32_t page_ordinal;
+  int64_t offset;
+  int32_t compressed_page_size;
+};
+
 class PARQUET_EXPORT LevelDecoder {
  public:
   LevelDecoder();
@@ -147,8 +159,20 @@ class PARQUET_EXPORT PageReader {
   // ApplicationVersion::HasCorrectStatistics().
   // \note API EXPERIMENTAL
   void set_data_page_filter(DataPageFilter data_page_filter) {
+    if (data_page_read_plan_enabled_) {
+      throw ParquetException(
+          "data_page_filter and data_page_read_plan cannot be enabled together");
+    }
     data_page_filter_ = std::move(data_page_filter);
   }
+
+  /// Configure PageReader to jump directly to selected data pages before reading
+  /// their headers. `first_data_page_offset` and each entry offset are relative to
+  /// the beginning of the column chunk stream. Dictionary pages before
+  /// `first_data_page_offset` are still read normally.
+  // \note API EXPERIMENTAL
+  void set_data_page_read_plan(int64_t first_data_page_offset,
+                               std::vector<DataPageReadPlanEntry> data_pages);
 
   // @returns: shared_ptr<Page>(nullptr) on EOS, std::shared_ptr<Page>
   // containing new Page otherwise
@@ -162,6 +186,11 @@ class PARQUET_EXPORT PageReader {
  protected:
   // Callback that decides if we should skip a page or not.
   DataPageFilter data_page_filter_;
+
+  bool data_page_read_plan_enabled_ = false;
+  int64_t first_data_page_offset_ = 0;
+  std::vector<DataPageReadPlanEntry> data_page_read_plan_;
+  size_t next_data_page_ = 0;
 };
 
 class PARQUET_EXPORT ColumnReader {

@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "parquet/arrow/reader.h"
 #include "parquet/arrow/schema.h"
 #include "parquet/column_reader.h"
 #include "parquet/file_reader.h"
@@ -70,7 +71,10 @@ class FileColumnIterator {
 
   virtual ~FileColumnIterator() {}
 
-  std::unique_ptr<::parquet::PageReader> NextChunk() {
+  /// \brief Fetch the PageReader for the next row group in this iterator's
+  /// range. Virtual so subclasses can decorate the returned PageReader, e.g.
+  /// to install a data_page_filter for I/O-level page skipping.
+  virtual std::unique_ptr<::parquet::PageReader> NextChunk() {
     if (row_groups_.empty()) {
       return nullptr;
     }
@@ -94,9 +98,6 @@ class FileColumnIterator {
   const SchemaDescriptor* schema_;
   std::deque<int> row_groups_;
 };
-
-using FileColumnIteratorFactory =
-    std::function<FileColumnIterator*(int, ParquetFileReader*)>;
 
 Status TransferColumnData(::parquet::internal::RecordReader* reader,
                           const std::shared_ptr<::arrow::Field>& value_field,

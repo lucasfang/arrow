@@ -178,7 +178,7 @@ static Status GetTimestampMetadata(const ::arrow::TimestampType& type,
 
   // The user is explicitly asking for Impala int96 encoding, there is no
   // logical type.
-  if (arrow_properties.support_deprecated_int96_timestamps()) {
+  if (arrow_properties.support_deprecated_int96_timestamps() && target_unit == ::arrow::TimeUnit::NANO) {
     *physical_type = ParquetType::INT96;
     return Status::OK();
   }

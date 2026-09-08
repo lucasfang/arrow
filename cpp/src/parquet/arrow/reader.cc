@@ -19,12 +19,14 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "arrow/array.h"
+#include "arrow/array/concatenate.h"
 #include "arrow/buffer.h"
 #include "arrow/extension_type.h"
 #include "arrow/io/memory.h"
@@ -32,12 +34,14 @@
 #include "arrow/table.h"
 #include "arrow/type.h"
 #include "arrow/util/async_generator.h"
+#include "arrow/util/bit_run_reader.h"
 #include "arrow/util/bit_util.h"
 #include "arrow/util/future.h"
 #include "arrow/util/iterator.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/parallel.h"
 #include "arrow/util/range.h"
+#include "arrow/util/span.h"
 #include "arrow/util/tracing_internal.h"
 #include "parquet/arrow/reader_internal.h"
 #include "parquet/column_reader.h"
@@ -253,6 +257,11 @@ class FileReaderImpl : public FileReader {
   Status GetColumn(int i, std::unique_ptr<ColumnReader>* out) override {
     return GetColumn(i, AllRowGroupsFactory(), out);
   }
+
+  ::arrow::Status GetColumn(
+      int i, const std::shared_ptr<std::unordered_set<int>>& column_indices,
+      FileColumnIteratorFactory iterator_factory,
+      std::unique_ptr<ColumnReader>* out) override;
 
   Status GetSchema(std::shared_ptr<::arrow::Schema>* out) override {
     return FromParquetSchema(reader_->metadata()->schema(), reader_properties_,
@@ -493,8 +502,38 @@ class LeafReader : public ColumnReaderImpl {
 
   ::arrow::Status BuildArray(int64_t length_upper_bound,
                              std::shared_ptr<::arrow::ChunkedArray>* out) final {
+    if (!out_) {
+      BEGIN_PARQUET_CATCH_EXCEPTIONS
+      RETURN_NOT_OK(
+          TransferColumnData(record_reader_.get(), field_, descr_, ctx_->pool, &out_));
+      END_PARQUET_CATCH_EXCEPTIONS
+    }
     *out = out_;
     return Status::OK();
+  }
+
+  std::vector<int> LeafColumnIndices() const final {
+    return {input_->column_index()};
+  }
+
+  ::arrow::Status ResetLeaf(int col_idx, int64_t reserve) final {
+    if (col_idx != input_->column_index()) return Status::OK();
+    BEGIN_PARQUET_CATCH_EXCEPTIONS
+    out_ = nullptr;
+    record_reader_->Reset();
+    record_reader_->Reserve(reserve);
+    return Status::OK();
+    END_PARQUET_CATCH_EXCEPTIONS
+  }
+
+  int64_t SkipRecords(int col_idx, int64_t num_records) final {
+    if (col_idx != input_->column_index() || num_records <= 0) return 0;
+    return record_reader_->SkipRecords(num_records);
+  }
+
+  int64_t ReadRecords(int col_idx, int64_t num_records) final {
+    if (col_idx != input_->column_index() || num_records <= 0) return 0;
+    return record_reader_->ReadRecords(num_records);
   }
 
   const std::shared_ptr<Field> field() override { return field_; }
@@ -530,6 +569,22 @@ class ExtensionReader : public ColumnReaderImpl {
 
   Status LoadBatch(int64_t number_of_records) final {
     return storage_reader_->LoadBatch(number_of_records);
+  }
+
+  std::vector<int> LeafColumnIndices() const final {
+    return storage_reader_->LeafColumnIndices();
+  }
+
+  ::arrow::Status ResetLeaf(int col_idx, int64_t reserve) final {
+    return storage_reader_->ResetLeaf(col_idx, reserve);
+  }
+
+  int64_t SkipRecords(int col_idx, int64_t num_records) final {
+    return storage_reader_->SkipRecords(col_idx, num_records);
+  }
+
+  int64_t ReadRecords(int col_idx, int64_t num_records) final {
+    return storage_reader_->ReadRecords(col_idx, num_records);
   }
 
   Status BuildArray(int64_t length_upper_bound,
@@ -574,6 +629,22 @@ class ListReader : public ColumnReaderImpl {
 
   Status LoadBatch(int64_t number_of_records) final {
     return item_reader_->LoadBatch(number_of_records);
+  }
+
+  std::vector<int> LeafColumnIndices() const final {
+    return item_reader_->LeafColumnIndices();
+  }
+
+  ::arrow::Status ResetLeaf(int col_idx, int64_t reserve) final {
+    return item_reader_->ResetLeaf(col_idx, reserve);
+  }
+
+  int64_t SkipRecords(int col_idx, int64_t num_records) final {
+    return item_reader_->SkipRecords(col_idx, num_records);
+  }
+
+  int64_t ReadRecords(int col_idx, int64_t num_records) final {
+    return item_reader_->ReadRecords(col_idx, num_records);
   }
 
   virtual ::arrow::Result<std::shared_ptr<ChunkedArray>> AssembleArray(
@@ -642,8 +713,10 @@ class ListReader : public ColumnReaderImpl {
 
   const std::shared_ptr<Field> field() override { return field_; }
 
- private:
+ protected:
   std::shared_ptr<ReaderContext> ctx_;
+
+ private:
   std::shared_ptr<Field> field_;
   ::parquet::internal::LevelInfo level_info_;
   std::unique_ptr<ColumnReaderImpl> item_reader_;
@@ -662,12 +735,62 @@ class PARQUET_NO_EXPORT FixedSizeListReader : public ListReader<int32_t> {
     DCHECK_EQ(field()->type()->id(), ::arrow::Type::FIXED_SIZE_LIST);
     const auto& type = checked_cast<::arrow::FixedSizeListType&>(*field()->type());
     const int32_t* offsets = reinterpret_cast<const int32_t*>(data->buffers[1]->data());
-    for (int x = 1; x <= data->length; x++) {
-      int32_t size = offsets[x] - offsets[x - 1];
-      if (size != type.list_size()) {
-        return Status::Invalid("Expected all lists to be of size=", type.list_size(),
-                               " but index ", x, " had size=", size);
+    const int32_t list_size = type.list_size();
+    auto validate_offsets = [&](int64_t start, int64_t length,
+                                bool has_elements) -> Status {
+      const int32_t expected_size = has_elements ? list_size : 0;
+      ::arrow::util::span<const int32_t> run_offsets(
+          offsets + start, static_cast<size_t>(length + 1));
+      const auto first_invalid_offset = std::adjacent_find(
+          run_offsets.begin(), run_offsets.end(),
+          [&](int32_t left, int32_t right) { return right - left != expected_size; });
+      if (first_invalid_offset != run_offsets.end()) {
+        const int64_t x =
+            start + std::distance(run_offsets.begin(), first_invalid_offset);
+        const int32_t size = offsets[x + 1] - offsets[x];
+        if (has_elements) {
+          return Status::Invalid("Expected all lists to be of size=", list_size,
+                                 " but index ", x + 1, " had size=", size);
+        }
+        return Status::Invalid("Expected null fixed-size list at index ", x + 1,
+                               " to have no child values but had size=", size);
       }
+      return Status::OK();
+    };
+    if (data->GetNullCount() != 0) {
+      // Rebuild the child array run-by-run so null fixed-size list slots still
+      // contribute list_size child values in the final layout.
+      ::arrow::ArrayVector child_arrays;
+
+      auto visit_run = [&](int64_t start, int64_t length, bool has_elements) -> Status {
+        RETURN_NOT_OK(validate_offsets(start, length, has_elements));
+
+        const int64_t child_length = length * list_size;
+        // Valid runs reuse the decoded child slice; null runs materialize null
+        // children to preserve the fixed-size list shape.
+        if (!has_elements) {
+          ARROW_ASSIGN_OR_RAISE(
+              auto null_array,
+              ::arrow::MakeArrayOfNull(type.value_type(), child_length, ctx_->pool));
+          child_arrays.push_back(std::move(null_array));
+          return Status::OK();
+        }
+        child_arrays.push_back(
+            ::arrow::MakeArray(data->child_data[0]->Slice(offsets[start], child_length)));
+        return Status::OK();
+      };
+
+      DCHECK_NE(data->buffers[0], nullptr);
+      RETURN_NOT_OK(::arrow::internal::VisitBitRuns(
+          data->buffers[0]->data(), data->offset, data->length, visit_run));
+
+      // TODO(GH-50271): Build one padded child array directly instead of creating
+      // one temporary Array/ArrayData per validity run and concatenating them.
+      ARROW_ASSIGN_OR_RAISE(auto child_array_with_padding,
+                            ::arrow::Concatenate(child_arrays, ctx_->pool));
+      data->child_data[0] = child_array_with_padding->data();
+    } else {
+      RETURN_NOT_OK(validate_offsets(/*start=*/0, data->length, /*valid=*/true));
     }
     data->buffers.resize(1);
     std::shared_ptr<Array> result = ::arrow::MakeArray(data);
@@ -709,6 +832,39 @@ class PARQUET_NO_EXPORT StructReader : public ColumnReaderImpl {
     }
     return Status::OK();
   }
+
+  std::vector<int> LeafColumnIndices() const override {
+    std::vector<int> indices;
+    for (const std::unique_ptr<ColumnReaderImpl>& reader : children_) {
+      std::vector<int> child_indices = reader->LeafColumnIndices();
+      indices.insert(indices.end(), child_indices.begin(), child_indices.end());
+    }
+    return indices;
+  }
+
+  ::arrow::Status ResetLeaf(int col_idx, int64_t reserve) override {
+    for (const std::unique_ptr<ColumnReaderImpl>& reader : children_) {
+      RETURN_NOT_OK(reader->ResetLeaf(col_idx, reserve));
+    }
+    return Status::OK();
+  }
+
+  int64_t SkipRecords(int col_idx, int64_t num_records) override {
+    int64_t skipped = 0;
+    for (const std::unique_ptr<ColumnReaderImpl>& reader : children_) {
+      skipped += reader->SkipRecords(col_idx, num_records);
+    }
+    return skipped;
+  }
+
+  int64_t ReadRecords(int col_idx, int64_t num_records) override {
+    int64_t read = 0;
+    for (const std::unique_ptr<ColumnReaderImpl>& reader : children_) {
+      read += reader->ReadRecords(col_idx, num_records);
+    }
+    return read;
+  }
+
   Status BuildArray(int64_t length_upper_bound,
                     std::shared_ptr<ChunkedArray>* out) override;
   Status GetDefLevels(const int16_t** data, int64_t* length) override;
@@ -1013,25 +1169,32 @@ Status FileReaderImpl::GetRecordBatchReader(const std::vector<int>& row_groups,
     return Status::OK();
   }
 
-  int64_t num_rows = 0;
+  std::vector<int64_t> num_rows;
   for (int row_group : row_groups) {
-    num_rows += parquet_reader()->metadata()->RowGroup(row_group)->num_rows();
+    num_rows.push_back(parquet_reader()->metadata()->RowGroup(row_group)->num_rows());
   }
 
   using ::arrow::RecordBatchIterator;
+  int row_group_idx = 0;
 
   // NB: This lambda will be invoked outside the scope of this call to
   // `GetRecordBatchReader()`, so it must capture `readers` and `batch_schema` by value.
   // `this` is a non-owning pointer so we are relying on the parent FileReader outliving
   // this RecordBatchReader.
   ::arrow::Iterator<RecordBatchIterator> batches = ::arrow::MakeFunctionIterator(
-      [readers, batch_schema, num_rows,
+      [readers, batch_schema, num_rows, row_group_idx,
        this]() mutable -> ::arrow::Result<RecordBatchIterator> {
         ::arrow::ChunkedArrayVector columns(readers.size());
 
-        // don't reserve more rows than necessary
-        int64_t batch_size = std::min(properties().batch_size(), num_rows);
-        num_rows -= batch_size;
+        int64_t batch_size = 0;
+        if (!num_rows.empty()) {
+          // don't reserve more rows than necessary
+          batch_size = std::min(properties().batch_size(), num_rows[row_group_idx]);
+          num_rows[row_group_idx] -= batch_size;
+          if (num_rows[row_group_idx] == 0 && (num_rows.size() - 1) != row_group_idx) {
+            row_group_idx++;
+          }
+        }
 
         RETURN_NOT_OK(::arrow::internal::OptionalParallelFor(
             reader_properties_.use_threads(), static_cast<int>(readers.size()),
@@ -1218,6 +1381,23 @@ Status FileReaderImpl::GetColumn(int i, FileColumnIteratorFactory iterator_facto
   ctx->pool = pool_;
   ctx->iterator_factory = iterator_factory;
   ctx->filter_leaves = false;
+  std::unique_ptr<ColumnReaderImpl> result;
+  RETURN_NOT_OK(GetReader(manifest_.schema_fields[i], ctx, &result));
+  *out = std::move(result);
+  return Status::OK();
+}
+
+::arrow::Status FileReaderImpl::GetColumn(
+    int i, const std::shared_ptr<std::unordered_set<int>>& column_indices,
+    FileColumnIteratorFactory iterator_factory,
+    std::unique_ptr<ColumnReader>* out) {
+  RETURN_NOT_OK(BoundsCheckColumn(i));
+  auto ctx = std::make_shared<ReaderContext>();
+  ctx->reader = reader_.get();
+  ctx->pool = pool_;
+  ctx->iterator_factory = iterator_factory;
+  ctx->filter_leaves = true;
+  ctx->included_leaves = column_indices;
   std::unique_ptr<ColumnReaderImpl> result;
   RETURN_NOT_OK(GetReader(manifest_.schema_fields[i], ctx, &result));
   *out = std::move(result);

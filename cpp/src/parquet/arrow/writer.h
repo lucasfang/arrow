@@ -138,6 +138,9 @@ class PARQUET_EXPORT FileWriter {
   /// option in this case.
   virtual ::arrow::Status WriteRecordBatch(const ::arrow::RecordBatch& batch) = 0;
 
+  /// \brief Return the buffered size in bytes.
+  virtual int64_t GetBufferedSize() = 0;
+
   /// \brief Write the footer and close the file.
   virtual ::arrow::Status Close() = 0;
   virtual ~FileWriter();

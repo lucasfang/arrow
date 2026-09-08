@@ -168,6 +168,26 @@ class ARROW_EXPORT BitRunReader {
 using BitRunReader = BitRunReaderLinear;
 #endif
 
+template <typename Visit>
+inline Status VisitBitRuns(const uint8_t* bitmap, int64_t offset, int64_t length,
+                           Visit&& visit) {
+  if (bitmap == NULLPTR) {
+    // Assuming all set (as in a null bitmap)
+    return visit(static_cast<int64_t>(0), length, true);
+  }
+  BitRunReader reader(bitmap, offset, length);
+  int64_t position = 0;
+  while (true) {
+    const auto run = reader.NextRun();
+    if (run.length == 0) {
+      break;
+    }
+    ARROW_RETURN_NOT_OK(visit(position, run.length, run.set));
+    position += run.length;
+  }
+  return Status::OK();
+}
+
 struct SetBitRun {
   int64_t position;
   int64_t length;
