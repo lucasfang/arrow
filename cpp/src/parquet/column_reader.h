@@ -370,6 +370,19 @@ class PARQUET_EXPORT RecordReader {
   /// \brief Pre-allocate space for data. Results in better flat read performance
   virtual void Reserve(int64_t num_values) = 0;
 
+  /// \brief Pre-allocate the variable-width value buffers for `num_values`
+  /// values totalling about `num_bytes` bytes.
+  ///
+  /// Fixed-width readers size their values buffer from Reserve() alone, so the
+  /// default is a no-op. The BYTE_ARRAY readers build into an
+  /// ::arrow::BinaryBuilder that Reserve() deliberately leaves alone
+  /// (uses_values_ is false for them), which is the only reason this second
+  /// hook exists: without it the builder's offsets and data buffers grow by
+  /// doubling once per decoded batch, and every doubling copies everything the
+  /// row group has accumulated so far. Both counts are additive, like
+  /// Reserve(); zero means "no estimate" and reserves nothing.
+  virtual void ReserveValueBytes(int64_t num_values, int64_t num_bytes) {}
+
   /// \brief Clear consumed values and repetition/definition levels as the
   /// result of calling ReadRecords
   /// For FLBA and ByteArray types, call GetBuilderChunks() to reset them.

@@ -350,11 +350,19 @@ class PARQUET_EXPORT ColumnReader {
   /// skip/read each leaf independently rather than in lockstep.
   virtual std::vector<int> LeafColumnIndices() const { return {}; }
 
-  /// \brief Reset the leaf identified by col_idx and reserve space for
-  /// `reserve` records (in that leaf's post-page-filter compressed space).
-  /// Must be called before SkipRecords()/ReadRecords() for that leaf, and
-  /// followed by BuildArray() to get the result.
-  virtual ::arrow::Status ResetLeaf(int col_idx, int64_t reserve) {
+  /// \brief Reset the leaf identified by col_idx and pre-allocate for the read
+  /// that follows. Must be called before SkipRecords()/ReadRecords() for that
+  /// leaf, and followed by BuildArray() to get the result.
+  ///
+  /// `reserve_records` is in that leaf's post-page-filter compressed space,
+  /// because SkipRecords walks the levels it bounds. `reserve_values` and
+  /// `reserve_value_bytes` describe what will actually be APPENDED, which on a
+  /// selective read is far less, and only the variable-width readers use the
+  /// byte count. Zero for the latter two means "no estimate" and reserves
+  /// nothing beyond `reserve_records`.
+  virtual ::arrow::Status ResetLeaf(int col_idx, int64_t reserve_records,
+                                    int64_t reserve_values,
+                                    int64_t reserve_value_bytes) {
     return ::arrow::Status::NotImplemented("ResetLeaf not implemented");
   }
 

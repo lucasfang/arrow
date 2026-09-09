@@ -2242,6 +2242,22 @@ class ByteArrayChunkedRecordReader final : public TypedRecordReader<ByteArrayTyp
     return result;
   }
 
+  void ReserveValueBytes(int64_t num_values, int64_t num_bytes) override {
+    if (num_values > 0) {
+      PARQUET_THROW_NOT_OK(accumulator_.builder->Reserve(num_values));
+    }
+    if (num_bytes > 0) {
+      // Never reserve past the current chunk: ArrowBinaryHelper pushes a chunk
+      // when the builder's data would exceed kBinaryMemoryLimit, and
+      // ReserveData() would fail the overflow check on a request past it. The
+      // clamp mirrors the one in ArrowBinaryHelper::Prepare.
+      const int64_t room =
+          ::arrow::kBinaryMemoryLimit - accumulator_.builder->value_data_length();
+      PARQUET_THROW_NOT_OK(
+          accumulator_.builder->ReserveData(std::min<int64_t>(num_bytes, room)));
+    }
+  }
+
   void ReadValuesDense(int64_t values_to_read) override {
     int64_t num_decoded = this->current_decoder_->DecodeArrowNonNull(
         static_cast<int>(values_to_read), &accumulator_);

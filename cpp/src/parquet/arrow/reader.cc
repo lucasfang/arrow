@@ -516,12 +516,15 @@ class LeafReader : public ColumnReaderImpl {
     return {input_->column_index()};
   }
 
-  ::arrow::Status ResetLeaf(int col_idx, int64_t reserve) final {
+  ::arrow::Status ResetLeaf(int col_idx, int64_t reserve_records,
+                            int64_t reserve_values,
+                            int64_t reserve_value_bytes) final {
     if (col_idx != input_->column_index()) return Status::OK();
     BEGIN_PARQUET_CATCH_EXCEPTIONS
     out_ = nullptr;
     record_reader_->Reset();
-    record_reader_->Reserve(reserve);
+    record_reader_->Reserve(reserve_records);
+    record_reader_->ReserveValueBytes(reserve_values, reserve_value_bytes);
     return Status::OK();
     END_PARQUET_CATCH_EXCEPTIONS
   }
@@ -575,8 +578,11 @@ class ExtensionReader : public ColumnReaderImpl {
     return storage_reader_->LeafColumnIndices();
   }
 
-  ::arrow::Status ResetLeaf(int col_idx, int64_t reserve) final {
-    return storage_reader_->ResetLeaf(col_idx, reserve);
+  ::arrow::Status ResetLeaf(int col_idx, int64_t reserve_records,
+                            int64_t reserve_values,
+                            int64_t reserve_value_bytes) final {
+    return storage_reader_->ResetLeaf(col_idx, reserve_records, reserve_values,
+                                      reserve_value_bytes);
   }
 
   int64_t SkipRecords(int col_idx, int64_t num_records) final {
@@ -635,8 +641,11 @@ class ListReader : public ColumnReaderImpl {
     return item_reader_->LeafColumnIndices();
   }
 
-  ::arrow::Status ResetLeaf(int col_idx, int64_t reserve) final {
-    return item_reader_->ResetLeaf(col_idx, reserve);
+  ::arrow::Status ResetLeaf(int col_idx, int64_t reserve_records,
+                            int64_t reserve_values,
+                            int64_t reserve_value_bytes) final {
+    return item_reader_->ResetLeaf(col_idx, reserve_records, reserve_values,
+                                   reserve_value_bytes);
   }
 
   int64_t SkipRecords(int col_idx, int64_t num_records) final {
@@ -842,9 +851,12 @@ class PARQUET_NO_EXPORT StructReader : public ColumnReaderImpl {
     return indices;
   }
 
-  ::arrow::Status ResetLeaf(int col_idx, int64_t reserve) override {
+  ::arrow::Status ResetLeaf(int col_idx, int64_t reserve_records,
+                            int64_t reserve_values,
+                            int64_t reserve_value_bytes) override {
     for (const std::unique_ptr<ColumnReaderImpl>& reader : children_) {
-      RETURN_NOT_OK(reader->ResetLeaf(col_idx, reserve));
+      RETURN_NOT_OK(reader->ResetLeaf(col_idx, reserve_records, reserve_values,
+                                      reserve_value_bytes));
     }
     return Status::OK();
   }
